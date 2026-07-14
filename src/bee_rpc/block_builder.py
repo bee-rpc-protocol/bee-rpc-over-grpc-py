@@ -27,6 +27,51 @@ def is_block(bytes_obj: bytes, blocks: List[bytes]) -> bool:
     return False
 
 
+def assert_container_covers_blocks(
+        container: Dict[str, List[List[int]]],
+        blocks: List[bytes],
+) -> None:
+    """Fail fast on an inconsistent block/pointer state.
+
+    Every hash in ``blocks`` was created by ``create_block`` and embedded in the
+    message as a block-pointer (``branch.file = block.SerializeToString()``), so
+    ``search_on_message`` MUST have detected each one and recorded it in
+    ``container``. If it did not, the message tree was traversed incompletely —
+    historically because block detection descended into repeated message fields
+    with a backend-specific ``isinstance(value, google._upb._message.
+    RepeatedCompositeContainer)`` check that is only true under the C/upb backend
+    and silently False under the pure-python backend the packer forces. The
+    traversal then skipped the repeated ``Filesystem.branch`` field, ``container``
+    came back ``{}`` while ``blocks`` held N hashes, and ``build_multiblock``
+    produced a metadata file whose block markers did not match the real blocks.
+    That inconsistency only surfaced far downstream as the cryptic
+    ``TypeError: object supporting the buffer API required`` when a
+    ``Buffer.Block`` marker object leaked into a stream hash instead of bytes.
+
+    Raise a clear, actionable error here instead. Detection is now
+    descriptor-based and backend-agnostic, so this guard should never trip; if it
+    does, it points squarely at a traversal/detection regression rather than
+    leaving a corrupt artifact to explode later.
+    """
+    detected = set(container.keys())
+    expected = {block.hex() for block in blocks}
+    missing = expected - detected
+    if missing:
+        preview = ', '.join(sorted(missing)[:4])
+        if len(missing) > 4:
+            preview += ', … (%d total)' % len(missing)
+        raise Exception(
+            'gRPCbb block_builder: inconsistent block state — %d block(s) were '
+            'created and embedded as pointers but search_on_message detected only '
+            '%d of them in the message tree. Missing: %s. This means block-pointer '
+            'traversal did not reach a repeated/nested message field (a protobuf '
+            'backend or detection mismatch). Refusing to build an inconsistent '
+            'multiblock artifact that would later crash with "object supporting the '
+            'buffer API required" during stream hashing.'
+            % (len(expected), len(expected) - len(missing), preview)
+        )
+
+
 def get_position_length(varint_pos: int, buffer: bytes) -> int:
     """
     Returns the value of the varint at the given position in the Protobuf buffer.
@@ -339,6 +384,8 @@ def build_multiblock(
         container=container
     )
 
+    assert_container_covers_blocks(container=container, blocks=blocks)
+
     tree: Dict[int, Union[Dict, str]] = create_lengths_tree(
         pointer_container=container
     )
@@ -477,6 +524,8 @@ def build_multiblock_fractal(
         blocks=blocks,
         container=container
     )
+
+    assert_container_covers_blocks(container=container, blocks=blocks)
 
     tree: Dict[int, Union[Dict, str]] = create_lengths_tree(
         pointer_container=container
