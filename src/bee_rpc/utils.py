@@ -6,12 +6,37 @@ from threading import Condition
 
 import typing
 
+from google.protobuf.descriptor import FieldDescriptor
+
 # GrpcBigBuffer.
 CHUNK_SIZE = 1024 * 1024  # 1MB
 MAX_DIR = 999999999
 WITHOUT_BLOCK_POINTERS_FILE_NAME = 'wbp.bin'
 METADATA_FILE_NAME = '_.json'
 BLOCK_LENGTH = 36
+
+
+def is_repeated_message_field(field: FieldDescriptor) -> bool:
+    """Whether ``field`` is a repeated message field that block traversal must recurse into.
+
+    Map fields are excluded: protobuf models them as a repeated message of synthesized
+    entries, but their values are not part of the message tree a block can hide in.
+
+    ``FieldDescriptor.label`` is not used to answer this. It was deprecated in protobuf
+    5.27 in favour of ``is_repeated`` and removed in 7.x, so reading it raises
+    ``AttributeError: 'google._upb._message.FieldDescriptor' object has no attribute
+    'label'`` on a current protobuf -- from inside ``contain_blocks``, which every
+    ``serialize_to_buffer`` call reaches, so nothing can be sent at all. ``is_repeated``
+    is preferred where it exists and ``label`` is the fallback for protobuf < 5.27, which
+    covers the whole range this package has ever been installed against.
+    """
+    is_repeated = getattr(field, "is_repeated", None)
+    if is_repeated is None:
+        is_repeated = field.label == FieldDescriptor.LABEL_REPEATED
+
+    return bool(is_repeated) \
+        and field.type == FieldDescriptor.TYPE_MESSAGE \
+        and not field.message_type.GetOptions().map_entry
 
 
 class EmptyBufferException(Exception):

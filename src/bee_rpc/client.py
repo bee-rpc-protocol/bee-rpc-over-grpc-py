@@ -10,19 +10,18 @@ from random import randint
 from typing import Callable, Generator, Union, List, Dict, Type
 
 from google.protobuf.message import DecodeError, Message
-from google.protobuf.descriptor import FieldDescriptor
 
 from bee_rpc import buffer_pb2
 from bee_rpc.block_driver import generate_wbp_file, WITHOUT_BLOCK_POINTERS_FILE_NAME, METADATA_FILE_NAME
 from bee_rpc.reader import read_block, read_multiblock_directory, read_from_registry, block_exists, read_bee_file
-from bee_rpc.utils import Enviroment, MAX_DIR, Signal, EmptyBufferException, Dir, CHUNK_SIZE
+from bee_rpc.utils import Enviroment, MAX_DIR, Signal, EmptyBufferException, Dir, CHUNK_SIZE, \
+    is_repeated_message_field
 
 
 ## Block driver ##
 def contain_blocks(message: Message) -> bool:
     for field, value in message.ListFields():
-        if field.label == FieldDescriptor.LABEL_REPEATED and field.type == FieldDescriptor.TYPE_MESSAGE \
-                and not field.message_type.GetOptions().map_entry:
+        if is_repeated_message_field(field):
             for element in value:
                 if contain_blocks(element):
                     return True
