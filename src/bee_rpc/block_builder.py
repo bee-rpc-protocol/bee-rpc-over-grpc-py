@@ -7,12 +7,11 @@ from itertools import zip_longest
 from typing import Any, List, Dict, Union, Tuple
 from bee_rpc import buffer_pb2
 from google.protobuf.message import Message, DecodeError
-from google.protobuf.descriptor import FieldDescriptor
 
 from bee_rpc.client import generate_random_dir, block_exists, move_to_block_dir, copy_to_block_dir, \
     get_hash_from_block
 from bee_rpc.utils import Enviroment, CHUNK_SIZE, METADATA_FILE_NAME, WITHOUT_BLOCK_POINTERS_FILE_NAME, \
-    get_file_hash, create_lengths_tree, encode_bytes
+    get_file_hash, create_lengths_tree, encode_bytes, is_repeated_message_field
 
 
 def is_block(bytes_obj: bytes, blocks: List[bytes]) -> bool:
@@ -74,8 +73,7 @@ def search_on_message_real(
     position: int = initial_position
     real_position: int = real_initial_position
     for field, value in message.ListFields():
-        if field.label == FieldDescriptor.LABEL_REPEATED and field.type == FieldDescriptor.TYPE_MESSAGE \
-                and not field.message_type.GetOptions().map_entry:
+        if is_repeated_message_field(field):
             for element in value:
                 position += 1
                 if position not in real_lengths.keys():
@@ -169,8 +167,7 @@ def search_on_message(
        """
     position: int = initial_position
     for field, value in message.ListFields():
-        if field.label == FieldDescriptor.LABEL_REPEATED and field.type == FieldDescriptor.TYPE_MESSAGE \
-                and not field.message_type.GetOptions().map_entry:
+        if is_repeated_message_field(field):
             for element in value:
                 search_on_message(
                     message=element,
