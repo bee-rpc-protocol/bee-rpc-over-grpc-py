@@ -1,14 +1,25 @@
 import json
 import os.path
-from typing import Callable, Union, List, Tuple, Dict, Generator
+from typing import Callable, Optional, Sequence, Union, List, Tuple, Dict, Generator
 
 from bee_rpc.validate_lengths_tree import validate_lengths_tree
-from bee_rpc.buffer_pb2 import Buffer
-from bee_rpc.utils import BLOCK_LENGTH, METADATA_FILE_NAME, WITHOUT_BLOCK_POINTERS_FILE_NAME, Enviroment, \
-    create_lengths_tree, encode_bytes, get_varint_at_position, get_pruned_block_length
+from bee_rpc.utils import METADATA_FILE_NAME, WITHOUT_BLOCK_POINTERS_FILE_NAME, Enviroment, \
+    create_lengths_tree, encode_bytes, get_varint_at_position, get_pruned_block_length, getsize, \
+    block_pointer, block_pointer_length
 
 
-def compute_wbp_lengths(tree: Dict[int, Union[Dict, str]], file_list: List[str]) -> Dict[int, int]:
+def compute_wbp_lengths(
+        tree: Dict[int, Union[Dict, str]],
+        file_list: List[str],
+        pointer_lengths: Dict[int, int]
+) -> Dict[int, int]:
+    """The length each varint must state once blocks are replaced by their pointers.
+
+    `pointer_lengths` says how long the pointer written at each position will be --
+    the very lengths `regenerate_buffer` then emits, so the two cannot disagree.
+    They used to be a constant here and a separately built message there, and drifted
+    into two different encodings of the same object.
+    """
     def __rec_compute_wbp_lengths(_tree: Dict[int, Union[Dict, str]], _file_list: List[str]) \
             -> Dict[int, Tuple[int, int]]:  # Tuple is wbp length and augmented pruned length.
         lengths: Dict[int, Tuple[int, int]] = {}
@@ -24,7 +35,7 @@ def compute_wbp_lengths(tree: Dict[int, Union[Dict, str]], file_list: List[str])
                     lengths[k] = (v[0], 0)
 
             else:
-                pruned_length: int = get_pruned_block_length(value)
+                pruned_length: int = get_pruned_block_length(value, pointer_lengths[key])
 
             if pruned_length > position_length:
                 raise Exception("gRPCbb on block_driver compute_wbp_lengths method, "
@@ -82,14 +93,26 @@ def set_varint_value(varint_pos: int, buffer: List[Union[bytes, str]], new_value
                 return
             offset += obj_size
         else:
-            offset += os.path.getsize(value)
+            # `varint_pos` is a position in the expanded stream, so a block entry
+            # advances the cursor by its whole expansion. A multiblock directory
+            # block measures as its dirent under `os.path.getsize`, which would put
+            # every varint after it at the wrong offset.
+            offset += getsize(value)
 
     raise Exception('gRPCbb block driver error on set varint value')
 
 
-def regenerate_buffer(lengths: Dict[int, int], buffer: List[Union[bytes, str]]) -> Generator[bytes, None, None]:
+def regenerate_buffer(
+        lengths: Dict[int, int],
+        buffer: List[Union[bytes, str]],
+        omit_types: bool = False
+) -> Generator[bytes, None, None]:
     """
     Replace real lengths with wbp lengths.
+
+    `omit_types` writes the compressed pointer form, for a stored object that has an
+    ancestor to inherit its hash types from. False -- the default -- spells them out,
+    which is what the top of a stored tree must do.
     """
     for varint_pos, new_value in sorted(lengths.items(), key=lambda x: x[0], reverse=True):
         set_varint_value(
@@ -102,19 +125,25 @@ def regenerate_buffer(lengths: Dict[int, int], buffer: List[Union[bytes, str]]) 
         if type(b) == bytes:
             yield b
         else:
-            block_buff = Buffer.Block(
-                hashes=[
-                    Buffer.Block.Hash(
-                        value=bytes.fromhex(str(b.split('/')[-1]))
-                    )
-                ]
+            yield block_pointer(
+                block_id=str(b.split('/')[-1]),
+                omit_types=omit_types
             ).SerializeToString()
-            if len(block_buff) != BLOCK_LENGTH:
-                raise Exception("gRPCbb regenerate buffer method, incorrect block format.")
-            yield block_buff
 
 
-def generate_wbp_file(dirname: str, debug: Callable[[str], None] = lambda s: None,):
+def generate_wbp_file(
+        dirname: str,
+        inherited: Optional[Sequence[bytes]] = None,
+        debug: Callable[[str], None] = lambda s: None,
+):
+    """Write the object with block pointers for an already-stored directory.
+
+    `inherited` is the hash-type context this directory sits in. None -- the default
+    -- means it is the top of a stored tree: its pointers spell out their own hash
+    types, because there is nothing above them to ask. Pass the enclosing pointer's
+    resolved types for a nested one, and its pointers are written in the compressed
+    form that inherits them.
+    """
     with open(dirname + '/' + METADATA_FILE_NAME, 'r') as f:
         _json: List[Union[
             int,
@@ -124,7 +153,9 @@ def generate_wbp_file(dirname: str, debug: Callable[[str], None] = lambda s: Non
     wbp_length = sum(os.path.getsize(os.path.join(dirname, str(e))) for e in _json if isinstance(e, int))     
     debug(f"Generate wbp file with length {(wbp_length / (1024 * 1024)):.2f} MB")
     
+    omit_types: bool = inherited is not None
     blocks: Dict[str, List[List[int]]] = {}
+    pointer_lengths: Dict[int, int] = {}
     buffer: List[Union[bytes, str]] = []
     file_list: List[str] = []
     for e in _json:
@@ -164,20 +195,28 @@ def generate_wbp_file(dirname: str, debug: Callable[[str], None] = lambda s: Non
             if block_name not in blocks: blocks[block_name] = [block_lengths]
             else:                        blocks[block_name].append(block_lengths)
 
+            # Measured once, here, and used by both the arithmetic below and the
+            # bytes emitted at the end -- the same pointer, so they cannot diverge.
+            pointer_lengths[block_lengths[-1]] = block_pointer_length(
+                block_id=block_name, omit_types=omit_types)
+
     debug("Buffer loaded correctly")
     debug("Validate lenghts tree")
-    
-    if not validate_lengths_tree(blocks=blocks, file_list=file_list):
-        debug("Failed on validate lengths")
-        exit() # TODO ??
+
+    # Raises rather than returning: a caller that cannot be told its object is
+    # unusable has no way to stop, retry or report, and the failure surfaces
+    # somewhere else entirely.
+    validate_lengths_tree(blocks=blocks, file_list=file_list,
+                          pointer_lengths=pointer_lengths, debug=debug)
 
     debug("Create lengths tree")
     tree: Dict[int, Union[Dict, str]] = create_lengths_tree(blocks)
 
     debug("Compute lengths tree")
-    recalculated_lengths: Dict[int, int] = compute_wbp_lengths(tree=tree, file_list=file_list)
+    recalculated_lengths: Dict[int, int] = compute_wbp_lengths(
+        tree=tree, file_list=file_list, pointer_lengths=pointer_lengths)
 
     debug("Write wbp file")
     with open(dirname + '/' + WITHOUT_BLOCK_POINTERS_FILE_NAME, 'wb') as f:
-        for c in regenerate_buffer(recalculated_lengths, buffer):
+        for c in regenerate_buffer(recalculated_lengths, buffer, omit_types=omit_types):
             f.write(c)
