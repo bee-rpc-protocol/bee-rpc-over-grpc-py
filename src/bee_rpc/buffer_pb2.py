@@ -13,7 +13,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0c\x62uffer.proto\x12\x06\x62uffer\"\x07\n\x05\x45mpty\"\xac\x04\n\x06\x42uffer\x12\x12\n\x05\x63hunk\x18\x01 \x01(\x0cH\x00\x88\x01\x01\x12\x16\n\tseparator\x18\x02 \x01(\x08H\x01\x88\x01\x01\x12\x13\n\x06signal\x18\x03 \x01(\x08H\x02\x88\x01\x01\x12&\n\x04head\x18\x04 \x01(\x0b\x32\x13.buffer.Buffer.HeadH\x03\x88\x01\x01\x12(\n\x05\x62lock\x18\x05 \x01(\x0b\x32\x14.buffer.Buffer.BlockH\x04\x88\x01\x01\x1a\xdc\x01\n\x04Head\x12\r\n\x05index\x18\x01 \x01(\x05\x12\x31\n\npartitions\x18\x02 \x03(\x0b\x32\x1d.buffer.Buffer.Head.Partition\x1a\x91\x01\n\tPartition\x12\x37\n\x05index\x18\x01 \x03(\x0b\x32(.buffer.Buffer.Head.Partition.IndexEntry\x1aK\n\nIndexEntry\x12\x0b\n\x03key\x18\x01 \x01(\x05\x12,\n\x05value\x18\x02 \x01(\x0b\x32\x1d.buffer.Buffer.Head.Partition:\x02\x38\x01\x1az\n\x05\x42lock\x12)\n\x06hashes\x18\x01 \x03(\x0b\x32\x19.buffer.Buffer.Block.Hash\x12!\n\x19previous_lengths_position\x18\x02 \x03(\x04\x1a#\n\x04Hash\x12\x0c\n\x04type\x18\x01 \x01(\x0c\x12\r\n\x05value\x18\x02 \x01(\x0c\x42\x08\n\x06_chunkB\x0c\n\n_separatorB\t\n\x07_signalB\x07\n\x05_headB\x08\n\x06_blockb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0c\x62uffer.proto\x12\x06\x62uffer\"\x07\n\x05\x45mpty\"\xde\x04\n\x06\x42uffer\x12\x12\n\x05\x63hunk\x18\x01 \x01(\x0cH\x00\x88\x01\x01\x12\x16\n\tseparator\x18\x02 \x01(\x08H\x01\x88\x01\x01\x12\x13\n\x06signal\x18\x03 \x01(\x08H\x02\x88\x01\x01\x12&\n\x04head\x18\x04 \x01(\x0b\x32\x13.buffer.Buffer.HeadH\x03\x88\x01\x01\x12(\n\x05\x62lock\x18\x05 \x01(\x0b\x32\x14.buffer.Buffer.BlockH\x04\x88\x01\x01\x12\'\n\x04skip\x18\x06 \x01(\x0b\x32\x14.buffer.Buffer.BlockH\x05\x88\x01\x01\x1a\xdc\x01\n\x04Head\x12\r\n\x05index\x18\x01 \x01(\x05\x12\x31\n\npartitions\x18\x02 \x03(\x0b\x32\x1d.buffer.Buffer.Head.Partition\x1a\x91\x01\n\tPartition\x12\x37\n\x05index\x18\x01 \x03(\x0b\x32(.buffer.Buffer.Head.Partition.IndexEntry\x1aK\n\nIndexEntry\x12\x0b\n\x03key\x18\x01 \x01(\x05\x12,\n\x05value\x18\x02 \x01(\x0b\x32\x1d.buffer.Buffer.Head.Partition:\x02\x38\x01\x1az\n\x05\x42lock\x12)\n\x06hashes\x18\x01 \x03(\x0b\x32\x19.buffer.Buffer.Block.Hash\x12!\n\x19previous_lengths_position\x18\x02 \x03(\x04\x1a#\n\x04Hash\x12\x0c\n\x04type\x18\x01 \x01(\x0c\x12\r\n\x05value\x18\x02 \x01(\x0c\x42\x08\n\x06_chunkB\x0c\n\n_separatorB\t\n\x07_signalB\x07\n\x05_headB\x08\n\x06_blockB\x07\n\x05_skipb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -26,15 +26,15 @@ if _descriptor._USE_C_DESCRIPTORS == False:
   _globals['_EMPTY']._serialized_start=24
   _globals['_EMPTY']._serialized_end=31
   _globals['_BUFFER']._serialized_start=34
-  _globals['_BUFFER']._serialized_end=590
-  _globals['_BUFFER_HEAD']._serialized_start=192
-  _globals['_BUFFER_HEAD']._serialized_end=412
-  _globals['_BUFFER_HEAD_PARTITION']._serialized_start=267
-  _globals['_BUFFER_HEAD_PARTITION']._serialized_end=412
-  _globals['_BUFFER_HEAD_PARTITION_INDEXENTRY']._serialized_start=337
-  _globals['_BUFFER_HEAD_PARTITION_INDEXENTRY']._serialized_end=412
-  _globals['_BUFFER_BLOCK']._serialized_start=414
-  _globals['_BUFFER_BLOCK']._serialized_end=536
-  _globals['_BUFFER_BLOCK_HASH']._serialized_start=501
-  _globals['_BUFFER_BLOCK_HASH']._serialized_end=536
+  _globals['_BUFFER']._serialized_end=640
+  _globals['_BUFFER_HEAD']._serialized_start=233
+  _globals['_BUFFER_HEAD']._serialized_end=453
+  _globals['_BUFFER_HEAD_PARTITION']._serialized_start=308
+  _globals['_BUFFER_HEAD_PARTITION']._serialized_end=453
+  _globals['_BUFFER_HEAD_PARTITION_INDEXENTRY']._serialized_start=378
+  _globals['_BUFFER_HEAD_PARTITION_INDEXENTRY']._serialized_end=453
+  _globals['_BUFFER_BLOCK']._serialized_start=455
+  _globals['_BUFFER_BLOCK']._serialized_end=577
+  _globals['_BUFFER_BLOCK_HASH']._serialized_start=542
+  _globals['_BUFFER_BLOCK_HASH']._serialized_end=577
 # @@protoc_insertion_point(module_scope)

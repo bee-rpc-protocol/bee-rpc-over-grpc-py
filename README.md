@@ -40,6 +40,7 @@ message Buffer  {
     optional bool signal = 3;
     optional Head head = 4;
     optional Block block = 5;
+    optional Block skip = 6;
 }
 
 ```
@@ -50,6 +51,17 @@ message Buffer  {
 - **signal**: This attribute allows the receiver to inform the sender that it can temporarily stop sending Buffers. This prevents the receiver from storing the buffer in memory if it does not need it at that moment. When the sender receives a Buffer with the `signal` active, it can resume sending.
 - **head**: The `head` attribute is used to specify the message's index and define the message's partition. The message index allows the same gRPC method to receive different objects identified by indices in its input and output. This facilitates interoperability between different objects within a single gRPC method.
 - **block**: A block is a subset of the buffer associated with a hash identifier. It allows the receiver to request that the sender skip the transmission of certain parts of the buffer if it already has that data.
+- **skip**: The request itself, travelling in the opposite direction to `block`: "I already hold this block, stop sending it". It is a separate field from `block` because on an inbound stream `block` already means a block boundary, and a receiver that read a skip request as one would splice the named block's content into whatever it was reconstructing.
+
+### Block Skipping
+
+Block skipping is opt-in per call, and both ends must opt in for it to save anything:
+
+- A **receiver** passes a `StreamControl` to `parse_from_buffer`; it queues a skip request whenever a block that exists locally begins to arrive.
+- A **sender** passes the same object to `serialize_to_buffer`; it drops the body of any block the peer has asked it to skip, and emits the block's end marker immediately.
+- Over gRPC, a client opts in with `client_grpc(..., block_skip=True)`; a server handler calls `control.watch()` once it has finished parsing its request, so that requests arriving during the response are still seen.
+
+A peer that does not honour skip requests parses them as an unknown field and ignores them, and the transfer completes exactly as it did before.
 
 ## Using Blocks (Buffer Containers)
 
@@ -57,9 +69,11 @@ Blocks are a fundamental feature of Bee-RPC for efficient management of large me
 
 1. When the receiver receives a Buffer with the `block` attribute, a list of block identifiers and a list of indices of the Protobuf lengths affected by the block are defined.
 2. The receiver checks if it already has the buffer on disk. If so, it can skip the transfer of that data.
-3. The receiver returns a Buffer to the sender with the same block.
-4. The sender receives the block and stops sending it, indicating to the receiver that subsequent Buffers are no longer part of the block.
-5. The receiver waits to receive that block again to continue accumulating data and paying attention to the content of the following Buffers.
+3. The receiver returns a Buffer to the sender naming that block in the `skip` attribute.
+4. The sender receives the request and stops sending the block's content, emitting the block's end marker immediately so that subsequent Buffers are no longer part of the block.
+5. The receiver waits to receive that block's end marker to continue accumulating data and paying attention to the content of the following Buffers.
+
+Steps 3 and 4 are best-effort: a sender that ignores the request transmits the block in full, and the receiver drains and discards it as it always has. Because the request cannot be sent before the block's start marker has arrived, some of the block is normally in flight already; the sender stops at the first chunk after the request lands.
 
 ### Nested Blocks
 

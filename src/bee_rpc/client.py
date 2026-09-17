@@ -3,6 +3,7 @@ import itertools
 import json
 import os
 import shutil
+import threading
 import typing
 import warnings
 from random import randint
@@ -12,6 +13,7 @@ from google.protobuf.message import DecodeError, Message
 
 from bee_rpc import buffer_pb2
 from bee_rpc.block_driver import generate_wbp_file, WITHOUT_BLOCK_POINTERS_FILE_NAME, METADATA_FILE_NAME
+from bee_rpc.control import StreamControl
 from bee_rpc.reader import read_block, read_multiblock_directory, read_from_registry, block_exists, read_bee_file
 from bee_rpc.utils import Enviroment, MAX_DIR, Signal, EmptyBufferException, Dir, CHUNK_SIZE, \
     block_id_from_pointer, is_repeated_message_field
@@ -157,9 +159,15 @@ def copy_to_block_dir(file_hash: str, file_path: str) -> bool:
     return False
 
 
-def signal_block_buffer_stream(hash: str):
-    # Receiver sends the Buffer with block attr. for stops the block buffer stream.
-    pass  # Sends Buffer(block=Block())
+def signal_block_buffer_stream(hash: str, control: typing.Optional[StreamControl] = None):
+    """Receiver-side: ask the peer to stop sending a block we already hold.
+
+    Without a control object there is nowhere to send the request, and this stays
+    the no-op it has always been -- the receiver still drains and discards the
+    block, which is correct, only not cheap.
+    """
+    if control is not None:
+        control.request_skip(hash)
 
 
 def get_hash_from_block(block: buffer_pb2.Buffer.Block,
@@ -224,6 +232,84 @@ def i_read_multiblock_directory(directory: str, delete_directory: bool = False, 
         -> Generator[Union[bytes, buffer_pb2.Buffer.Block], None, None]:
     for i in read_multiblock_directory(directory, delete_directory, ignore_blocks):
         yield i
+
+
+def skip_requested_blocks(
+        buffer_iterator: Generator[buffer_pb2.Buffer, None, None],
+        control: typing.Optional[StreamControl] = None,
+) -> Generator[buffer_pb2.Buffer, None, None]:
+    """Sender-side: drop the body of any block the peer has told us it already has.
+
+    The stream this filters is the flat one `read_from_registry` produces --
+    block start marker, chunks, block end marker (the same marker object again),
+    nested to `Enviroment.block_depth`. The peer's skip set is consulted *at
+    chunk granularity*, not once per block, because the request cannot arrive
+    before the start marker that triggers it: the receiver only learns the hash
+    when the marker reaches it, so by the time its answer gets back some chunks
+    are already in flight. Re-checking per chunk means we stop at the first one
+    after the request lands, wherever in the block that falls.
+
+    Two invariants the receiver's drain path (`save_chunks_to_block`'s else
+    branch, and `stop_generator`) depends on:
+
+      * the end marker is *always* emitted, exactly once, skipped or not -- it is
+        what the receiver is scanning for, and a block whose terminator never
+        arrives desynchronises the rest of the stream;
+      * a skipped block swallows its children. Their markers are suppressed too,
+        which is what the receiver expects: it is not reading the parent's body
+        at all, so a child marker appearing inside it would be a block boundary
+        in a region it has already decided to ignore. `previous_lengths_position`
+        accounting is unaffected either way -- the receiver records it from the
+        *start* marker (`save_chunks_to_block` appends to `_json` before it
+        chooses to save or to drain), and start markers are always emitted.
+    """
+    if control is None or not control.enabled:
+        yield from buffer_iterator
+        return
+
+    stack: List[str] = []
+    skipping_at: typing.Optional[int] = None  # 1-based stack depth of the skipped block
+
+    def outermost_skipped() -> typing.Optional[int]:
+        """Depth of the shallowest open block the peer has asked us to skip.
+
+        The shallowest, not the innermost: a request for a parent that lands
+        while we are already inside a child has to take the parent's whole
+        remainder with it, children included.
+        """
+        for depth, block_id in enumerate(stack, start=1):
+            if control.should_skip(block_id):
+                return depth
+        return None
+
+    for b in buffer_iterator:
+        if b.HasField('block'):
+            block_id: str = get_hash_from_block(b.block)
+
+            if stack and stack[-1] == block_id:
+                depth = len(stack)
+                stack.pop()
+                if skipping_at is None or skipping_at == depth:
+                    # Either nothing is being skipped, or the block being skipped
+                    # ends right here. Its terminator is the one thing the
+                    # receiver still needs: it is what the drain loop in
+                    # save_chunks_to_block (and stop_generator) scans for.
+                    if skipping_at == depth:
+                        skipping_at = None
+                    yield b
+                # else: nested inside a shallower skipped block, suppressed with it.
+                continue
+
+            stack.append(block_id)
+            if skipping_at is None:
+                yield b
+                skipping_at = outermost_skipped()
+            continue
+
+        if skipping_at is None:
+            skipping_at = outermost_skipped()
+        if skipping_at is None:
+            yield b
 
 
 def stop_generator(iterator, block_id):
@@ -429,9 +515,24 @@ def parse_from_buffer(
         partitions_message_mode: Union[bool, Dict[int, bool]] = False,  # Write on disk by default.
         mem_manager=None,
         debug: Callable[[str], None] = lambda s: None,
+        control: typing.Optional[StreamControl] = None,
 ):
+    """`control`, when given, turns block deduplication into a bandwidth saving
+    rather than only a disk one: every time a block that already exists locally
+    starts arriving, a skip request is queued for the opposite direction of the
+    call. The same object must be handed to the `serialize_to_buffer` that
+    produces this party's outgoing stream, which is what actually emits them.
+
+    It also strips inbound skip requests -- the peer's, aimed at our sender --
+    out of the stream before anything else sees them.
+
+    Omitted, this is exactly the previous behaviour: blocks already held are
+    still drained off the wire and discarded.
+    """
     try:
         debug("Starting parse_from_buffer")
+        if control is not None and control.enabled:
+            request_iterator = control.reader(request_iterator)
         if not indices:
             debug("Indices not provided, setting default value (buffer_pb2.Empty)")
             indices = buffer_pb2.Empty()
@@ -523,7 +624,9 @@ def parse_from_buffer(
                             blocks.append(block_hash)
 
                         if block_exists(block_hash):
-                            signal_block_buffer_stream(block_hash)  # Send the sub-buffer stop signal
+                            # Send the sub-buffer stop signal: tell the peer not to
+                            # bother sending the body of a block we already hold.
+                            signal_block_buffer_stream(block_hash, control=control)
 
                         yield buffer_obj
                         for block_chunk in parser_iterator(
@@ -743,8 +846,17 @@ def serialize_to_buffer(
         signal=None,
         indices: Union[Message, Dict[int, Union[Type[bytes], Message]]] = None,
         mem_manager=None,
-        debug: Callable[[str], None] = lambda s: None  # Debug function
+        debug: Callable[[str], None] = lambda s: None,  # Debug function
+        control: typing.Optional[StreamControl] = None
 ) -> Generator[buffer_pb2.Buffer, None, None]:  # method: indice
+    """`control`, when given, does two things to this stream:
+
+    it suppresses the body of any block the peer has said it already holds (see
+    `skip_requested_blocks`), and it interleaves this party's own skip requests
+    -- the ones its parse side has queued -- into the direction it is sending, so
+    that the peer's sender can act on them. Both are no-ops when it is omitted,
+    and the stream is then byte-for-byte what it has always been.
+    """
     try:
         debug("Entering serialize_to_buffer")  # Log entry
 
@@ -802,10 +914,13 @@ def serialize_to_buffer(
         yield buffer_pb2.Buffer(
             head=_head
         )
-        for _b in read_from_registry(
+        for _b in skip_requested_blocks(
+            read_from_registry(
                 filename=filedir,
                 signal=_signal,
                 debug=debug
+            ),
+            control=control
         ):
             _signal.wait()
             try:
@@ -858,9 +973,12 @@ def serialize_to_buffer(
             with open(file, 'wb') as f, _mem_manager(len=len(message_bytes)):
                 f.write(message_bytes)
             try:
-                yield from read_from_registry(
-                    filename=file,
-                    signal=_signal
+                yield from skip_requested_blocks(
+                    read_from_registry(
+                        filename=file,
+                        signal=_signal
+                    ),
+                    control=control
                 )
             finally:
                 remove_file(file)
@@ -872,27 +990,46 @@ def serialize_to_buffer(
             finally:
                 _signal.wait()
 
-    for message in message_iterator:
-        debug(f"Processing message: {message}") # Log each message being processed
-        if type(message) is Dir:
-            debug(f"Message is a Dir, sending file: {message.dir}")
-            yield from send_file(
-                _head=buffer_pb2.Buffer.Head(
-                    index=indices[message.type]
-                ),
-                filedir=message.dir,
-                _signal=signal
-            )
-        else:
-            debug(f"Message is not a Dir, sending message: {message}")
-            yield from send_message(
-                _signal=signal,
-                _message=message,
-                _head=buffer_pb2.Buffer.Head(
-                    index=indices[type(message)]
-                ),
-                _mem_manager=mem_manager,
-            )
+    def payload() -> Generator[buffer_pb2.Buffer, None, None]:
+        for message in message_iterator:
+            debug(f"Processing message: {message}") # Log each message being processed
+            if type(message) is Dir:
+                debug(f"Message is a Dir, sending file: {message.dir}")
+                yield from send_file(
+                    _head=buffer_pb2.Buffer.Head(
+                        index=indices[message.type]
+                    ),
+                    filedir=message.dir,
+                    _signal=signal
+                )
+            else:
+                debug(f"Message is not a Dir, sending message: {message}")
+                yield from send_message(
+                    _signal=signal,
+                    _message=message,
+                    _head=buffer_pb2.Buffer.Head(
+                        index=indices[type(message)]
+                    ),
+                    _mem_manager=mem_manager,
+                )
+
+    if control is None or not control.enabled:
+        yield from payload()
+    else:
+        try:
+            for buffer in payload():
+                # Our own skip requests ride out alongside our payload. They are
+                # emitted before each buffer rather than after, so that a request
+                # queued while the previous one was in flight leaves as early as
+                # it can -- every buffer of delay here is a chunk of the peer's
+                # block we pay for anyway (the race window in issue #8).
+                for outbound in control.pending_outbound():
+                    yield outbound
+                yield buffer
+            for outbound in control.pending_outbound():
+                yield outbound
+        finally:
+            control.finish_sending()
     debug("Exiting serialize_to_buffer") # Log exit
 
 
@@ -904,8 +1041,23 @@ def client_grpc(
         partitions_message_mode_parser: Union[bool, list, dict] = None,
         indices_serializer: Union[Message, Dict[int, Union[Type[bytes], Message]]] = None,
         mem_manager=None,
-        debug: Callable[[str], None]=lambda s: None
+        debug: Callable[[str], None]=lambda s: None,
+        block_skip: bool = False
 ):  # indice: method
+    """`block_skip` opts this call into reverse-direction block skipping.
+
+    It is off by default because it changes the shape of the request direction:
+    the request generator can no longer end as soon as the input is serialized,
+    since skip requests are only discovered while the *response* is being parsed,
+    and gRPC half-closes the call the moment the request iterator raises
+    StopIteration. With it on, the request generator yields its input, then holds
+    the direction open -- waking only to forward a queued skip request -- until
+    the response iterator is exhausted or the caller stops consuming it.
+
+    The peer needs to be honouring skip requests for this to save anything; if it
+    is not, the requests are ignored as unknown fields and the response arrives
+    in full, which is the pre-existing behaviour.
+    """
     if not indices_parser:
         indices_parser = buffer_pb2.Empty
         partitions_message_mode_parser = True
@@ -913,22 +1065,68 @@ def client_grpc(
     if not indices_serializer: indices_serializer = {}
     if not mem_manager: mem_manager = Enviroment.mem_manager
     signal = Signal()
-    yield from parse_from_buffer(
-        request_iterator=method(
-            serialize_to_buffer(
-                message_iterator=input if input else buffer_pb2.Empty(),
-                signal=signal,
-                indices=indices_serializer,
-                mem_manager=mem_manager,
-                debug=debug
+
+    if not block_skip:
+        yield from parse_from_buffer(
+            request_iterator=method(
+                serialize_to_buffer(
+                    message_iterator=input if input else buffer_pb2.Empty(),
+                    signal=signal,
+                    indices=indices_serializer,
+                    mem_manager=mem_manager,
+                    debug=debug
+                ),
+                timeout=timeout
             ),
-            timeout=timeout
-        ),
-        signal=signal,
-        indices=indices_parser,
-        partitions_message_mode=partitions_message_mode_parser,
-        debug=debug
-    )
+            signal=signal,
+            indices=indices_parser,
+            partitions_message_mode=partitions_message_mode_parser,
+            debug=debug
+        )
+        return
+
+    control = StreamControl()
+    response_done = threading.Event()
+
+    def request_stream() -> Generator[buffer_pb2.Buffer, None, None]:
+        # The input, with this party's skip requests interleaved by
+        # serialize_to_buffer (there will be none yet -- the response has not
+        # started arriving -- but a multi-message input can outlive the first of
+        # them).
+        yield from serialize_to_buffer(
+            message_iterator=input if input else buffer_pb2.Empty(),
+            signal=signal,
+            indices=indices_serializer,
+            mem_manager=mem_manager,
+            debug=debug,
+            control=control
+        )
+        # Input exhausted, but NOT the call: ending here would half-close the
+        # request direction and there would be no way left to reach the server
+        # with a skip request. Hold it open, forwarding requests as they are
+        # queued by the parse side, until the response is done with.
+        while not response_done.is_set():
+            outbound = control.next_outbound(timeout=0.05)
+            if outbound is not None:
+                debug("Sending block skip request upstream")
+                yield outbound
+
+    try:
+        yield from parse_from_buffer(
+            request_iterator=method(request_stream(), timeout=timeout),
+            signal=signal,
+            indices=indices_parser,
+            partitions_message_mode=partitions_message_mode_parser,
+            debug=debug,
+            control=control
+        )
+    finally:
+        # Reached on normal exhaustion, on an exception, and on the caller
+        # abandoning this generator (next() once and drop it, which is how most
+        # of nodo calls it). In every case the request direction must be allowed
+        # to end, or its thread parks until the call is torn down.
+        response_done.set()
+        control.finish_sending()
 
 
 def write_to_file(
