@@ -16,7 +16,7 @@ from bee_rpc.block_driver import generate_wbp_file, WITHOUT_BLOCK_POINTERS_FILE_
 from bee_rpc.control import StreamControl
 from bee_rpc.reader import read_block, read_multiblock_directory, read_from_registry, block_exists, read_bee_file
 from bee_rpc.utils import Enviroment, MAX_DIR, Signal, EmptyBufferException, Dir, CHUNK_SIZE, \
-    block_id_from_pointer, is_repeated_message_field
+    block_id_from_pointer, is_repeated_message_field, resolve_hash_types, HashTypeError, BlockIdMismatch
 
 
 ## Block driver ##
@@ -312,6 +312,11 @@ def skip_requested_blocks(
             yield b
 
 
+# How deep a received stream may nest blocks. Each level is a frame of recursion
+# on this side; a real tree (an object, its filesystem, its files) is three.
+MAX_BLOCK_NESTING = 32
+
+
 def stop_generator(iterator, block_id):
     for b in iterator:
         if b.HasField('block') and get_hash_from_block(b.block) == block_id:
@@ -320,6 +325,91 @@ def stop_generator(iterator, block_id):
             break
         else:
             yield b
+
+
+def save_block_content(
+        block_buffer: buffer_pb2.Buffer,
+        block_id: str,
+        buffer_iterator,
+        signal: Signal = None,
+        debug: Callable[[str], None] = lambda s: None,
+        hashers: typing.Sequence = (),
+):
+    """Store one block, in the form its stream had.
+
+    A stream that frames blocks inside this one (the sender's `block_depth`
+    allows it) is stored as a multiblock directory -- `_.json`, the pointer form, the
+    nested blocks as blocks of their own -- which is the form the sender holds. A
+    stream with nothing nested is one flat file, as it always was. Flattening the
+    first into the second would inline every nested block again: the receiver
+    holds an image it never needed to, and a message inside it can pass the 2 GiB
+    a protobuf can be parsed from.
+
+    Written beside its final path and renamed into place, so the block appears
+    only once it is complete, and only if its content hashes to its id: a block id
+    is a claim about the bytes, and a store keyed by it has to hold the bytes it
+    names. The content is the block's expansion, so the bytes of every block nested
+    in it count too; `hashers` are the blocks around this one, fed the same bytes.
+    """
+    hasher = Enviroment.hash_factory()
+    hashers = tuple(hashers) + (hasher,)
+    final = Enviroment.block_dir + block_id
+    tmp = final + '.tmp-' + str(randint(0, MAX_DIR))
+    os.makedirs(tmp)
+    ready = tmp
+    try:
+        _json: List[Union[int, typing.Tuple[str, List[int]]]] = []
+        prev = block_buffer.chunk if block_buffer.HasField('chunk') else None
+        index = 1
+        while True:
+            _json.append(index)
+            if save_chunks_to_file(
+                    filename=tmp + '/' + str(index),
+                    buffer_iterator=buffer_iterator,
+                    signal=signal,
+                    _json=_json,
+                    prev=prev,
+                    debug=debug,
+                    hashers=hashers
+            ):
+                break
+            prev = None
+            index += 1
+
+        if hasher.hexdigest() != block_id:
+            raise BlockIdMismatch(
+                'bee-rpc: the received block %s hashes to %s. Its content is not '
+                'what its id names; it is not stored.' % (block_id, hasher.hexdigest()))
+
+        if len(_json) < 2:
+            ready = tmp + '.file'
+            os.replace(tmp + '/1', ready)
+            shutil.rmtree(tmp)
+        else:
+            with open(tmp + '/' + METADATA_FILE_NAME, 'w') as f:
+                json.dump(_json, f)
+            if not Enviroment.skip_wbp_generation:
+                try:
+                    inherited = resolve_hash_types(block_buffer.block)
+                except HashTypeError:
+                    inherited = None
+                generate_wbp_file(tmp, inherited=inherited, debug=debug)
+
+        if block_exists(block_id):  # Written meanwhile by another stream.
+            _remove(ready)
+        else:
+            os.replace(ready, final)
+    except BaseException:
+        _remove(ready)
+        _remove(tmp)
+        raise
+
+
+def _remove(path: str):
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+    elif os.path.exists(path):
+        os.remove(path)
 
 
 def save_chunks_to_block(
@@ -331,6 +421,7 @@ def save_chunks_to_block(
             typing.Tuple[str, List[int]]
         ]] = None,
         debug: Callable[[str], None] = lambda s: None,
+        hashers: typing.Sequence = (),
 ):
     try:
         debug("Save chunks to block ...")
@@ -346,11 +437,13 @@ def save_chunks_to_block(
             )
         if not block_exists(block_id):  # Second comprobation of that.
             debug(f"The block {block_id} does not exists, saving it.")
-            save_chunks_to_file(
-                prev=block_buffer.chunk if block_buffer.HasField('chunk') else None,
+            save_block_content(
+                block_buffer=block_buffer,
+                block_id=block_id,
                 buffer_iterator=stop_generator(buffer_iterator, block_id),
-                filename=Enviroment.block_dir + block_id,
-                signal=signal
+                signal=signal,
+                debug=debug,
+                hashers=hashers,
             )
         else:
             debug(f"The block {block_id} does exists, skipping all the block buffer.")
@@ -359,6 +452,13 @@ def save_chunks_to_block(
                         get_hash_from_block(buffer.block) == block_id:
                     debug(f"Block {block_id} buffer moved.")
                     break
+            if hashers:
+                # The blocks around this one still need its bytes to check their
+                # own ids. The ones held here are the ones the id names; what the
+                # sender pushed before it stopped is not used.
+                for piece in read_block(block_id=block_id, ignore_blocks=True):
+                    for h in hashers:
+                        h.update(piece)
     except Exception as e:
         debug(f"Exception saving chunks to block {_json}: {e}")
         raise e
@@ -374,6 +474,7 @@ def save_chunks_to_file(
     ]] = None,
     prev: typing.Optional[bytes] = None,
     debug: Callable[[str], None] = lambda s: None,
+    hashers: typing.Sequence = (),
 ) -> bool:
     debug(f"Save chunks to file {filename} ...")
     if not signal: signal = Signal(exist=False)
@@ -384,6 +485,8 @@ def save_chunks_to_file(
             signal.wait()
             if prev:
                 f.write(prev)
+                for h in hashers:
+                    h.update(prev)
                 del prev
 
             for buffer in buffer_iterator:
@@ -393,10 +496,13 @@ def save_chunks_to_file(
                         buffer_iterator=buffer_iterator,
                         signal=signal,
                         _json=_json,
-                        debug=debug
+                        debug=debug,
+                        hashers=hashers
                     )
                     return False
                 f.write(buffer.chunk)
+                for h in hashers:
+                    h.update(buffer.chunk)
             debug(f"Save chunks to the file {filename} ends")
             return True
     except Exception as e:
@@ -587,6 +693,7 @@ def parse_from_buffer(
         if not signal_obj:
             debug("signal_obj not provided, creating new Signal")
             signal_obj = Signal(exist=False)
+        inside_block: bool = bool(blocks)
         while True:
             try:
                 try:
@@ -605,36 +712,52 @@ def parse_from_buffer(
                 debug("Field 'signal' detected, changing signal_obj state")
                 signal_obj.change()
 
-            if not blocks and buffer_obj.HasField('block') or \
-                    blocks and buffer_obj.HasField('block') and len(blocks) < Enviroment.block_depth:
-                block_hash: str = get_hash_from_block(buffer_obj.block)
+            if buffer_obj.HasField('block'):
+                block_hash: typing.Optional[str] = get_hash_from_block(buffer_obj.block)
+
+                if block_hash and blocks and block_hash in blocks:
+                    # The end marker of an open block. The outermost one is not
+                    # yielded: the iterator ending is what tells its reader the block
+                    # is done. A block inside another is read from the same stream as
+                    # the one around it, which goes on, so there the marker is passed
+                    # on for `stop_generator` to stop at.
+                    if blocks.pop() == block_hash:
+                        debug(f"Block {block_hash} removed from blocks")
+                        if blocks:
+                            yield buffer_obj
+                        break
+                    debug("Error: Block intersections are not allowed")
+                    raise Exception('gRPCbb: IntersectionError: Intersections between blocks are not allowed.')
+
+                if block_hash and len(blocks or ()) >= MAX_BLOCK_NESTING:
+                    raise Exception(
+                        'gRPCbb: blocks nested more than %d deep.' % MAX_BLOCK_NESTING)
 
                 if block_hash:
-                    if blocks and block_hash in blocks:
-                        if blocks.pop() == block_hash:
-                            debug(f"Block {block_hash} removed from blocks")
-                            break
-                        else:
-                            debug("Error: Block intersections are not allowed")
-                            raise Exception('gRPCbb: IntersectionError: Intersections between blocks are not allowed.')
+                    # Whatever depth the sender framed: `block_depth` is how deep
+                    # this node *sends*, so a node can read nested blocks from
+                    # peers before it sends any itself.
+                    if not blocks:
+                        blocks = [block_hash]
                     else:
-                        if not blocks:
-                            blocks = [block_hash]
-                        else:
-                            blocks.append(block_hash)
+                        blocks.append(block_hash)
 
-                        if block_exists(block_hash):
-                            # Send the sub-buffer stop signal: tell the peer not to
-                            # bother sending the body of a block we already hold.
-                            signal_block_buffer_stream(block_hash, control=control)
+                    if block_exists(block_hash):
+                        # Send the sub-buffer stop signal: tell the peer not to
+                        # bother sending the body of a block we already hold.
+                        signal_block_buffer_stream(block_hash, control=control)
 
-                        yield buffer_obj
-                        for block_chunk in parser_iterator(
-                                request_iterator_obj=request_iterator_obj,
-                                signal_obj=signal_obj,
-                                blocks=blocks
-                        ):
-                            yield block_chunk
+                    yield buffer_obj
+                    for block_chunk in parser_iterator(
+                            request_iterator_obj=request_iterator_obj,
+                            signal_obj=signal_obj,
+                            blocks=blocks
+                    ):
+                        yield block_chunk
+
+                    if inside_block:
+                        # A block nested in this one is closed; this one goes on.
+                        continue
 
             if buffer_obj.HasField('chunk'):
                 debug("Yielding normal chunk")

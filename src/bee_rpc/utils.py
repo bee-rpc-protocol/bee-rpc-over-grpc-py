@@ -46,6 +46,10 @@ class EmptyBufferException(Exception):
     pass
 
 
+class BlockIdMismatch(Exception):
+    """A block's content does not hash to the id it arrived under."""
+
+
 class HashTypeError(Exception):
     """A hash type is unknown to this node, or none can be deduced for a hash's index."""
 
@@ -179,6 +183,8 @@ class Enviroment(type):
     _instances = {}
     cache_dir = os.path.abspath(os.curdir) + '/__cache__/'
     block_dir = os.path.abspath(os.curdir) + '/__block__/'
+    # How many levels of blocks this node frames when it sends: 1 sends the
+    # content of each block flat. A receiver reads any depth (client.MAX_BLOCK_NESTING).
     block_depth = 1
     skip_wbp_generation = False
     mem_manager = lambda len: MemManager(len=len)

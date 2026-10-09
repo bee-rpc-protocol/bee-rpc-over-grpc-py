@@ -49,7 +49,7 @@ def read_file_by_chunks(filename: str, signal: Signal = None, debug: Callable[[s
         gc.collect()
 
 # TODO should be re-implemented like utils.getsize
-def read_multiblock_directory(directory: str, delete_directory: bool = False, ignore_blocks: bool = True, debug: Callable[[str], None] = lambda s: None) \
+def read_multiblock_directory(directory: str, delete_directory: bool = False, ignore_blocks: bool = True, debug: Callable[[str], None] = lambda s: None, _depth: int = 1) \
         -> Generator[Union[bytes, buffer_pb2.Buffer.Block], None, None]:
     debug(f"Read multiblock directory {directory}. Delete dir: {delete_directory}.  Ignore blocks: {ignore_blocks}")
     if directory[-1] != '/':
@@ -75,19 +75,25 @@ def read_multiblock_directory(directory: str, delete_directory: bool = False, ig
                 yield block
                 debug(f"yielded block init")
                 # The marker already names the block; what follows it on the wire is
-                # the block's *content*, always flat. A block that is itself a
+                # the block's *content*. Flat, by default: a block that is itself a
                 # multiblock directory used to be expanded with ignore_blocks=False
-                # here, which emitted its sub-blocks' markers too -- carrying
+                # here, which emitted its sub-blocks' markers carrying
                 # `previous_lengths_position` values that are offsets into the nested
                 # block's own stream, into a stream where they mean nothing. A
-                # receiver writes those straight to its `_.json`
-                # (client.save_chunks_to_block), producing metadata in two mixed
+                # receiver that took them for its own wrote metadata in two mixed
                 # coordinate systems that no length arithmetic can make sense of.
-                # Streaming flat keeps the nesting an implementation detail of
-                # whoever stores the block: the bytes are the same either way, and a
-                # directory block's id is the hash of exactly this expansion
-                # (block_builder.generate_id), so the receiver can verify it.
-                yield from read_block(block_id=block_id, debug=debug, ignore_blocks=True)
+                # The bytes are the same either way, and a directory block's id is
+                # the hash of exactly this expansion (block_builder.generate_id), so
+                # the receiver can verify it.
+                #
+                # Where `Enviroment.block_depth` reaches one level further, the nested
+                # level is framed too, and a receiver that reads that deep gives the
+                # block its own `_.json` (client.save_block_content), so its offsets
+                # stay in its own coordinates. Without it the receiver holds the
+                # block as one flat file holding the whole expansion.
+                nested = _depth < Enviroment.block_depth
+                yield from read_block(block_id=block_id, debug=debug,
+                                      ignore_blocks=not nested, _depth=_depth + 1)
                 debug("- yielding block end")
                 yield block
                 debug(f"yielded block end")
@@ -125,7 +131,7 @@ def _verify_single_file_block(path: str, block_id: str) -> None:
         )
 
 
-def read_block(block_id: str, debug: Callable[[str], None] = lambda s: None, ignore_blocks: bool = True) -> Generator[Union[bytes, buffer_pb2.Buffer.Block], None, None]:
+def read_block(block_id: str, debug: Callable[[str], None] = lambda s: None, ignore_blocks: bool = True, _depth: int = 1) -> Generator[Union[bytes, buffer_pb2.Buffer.Block], None, None]:
     """Stream a block's content, whichever shape it is stored in.
 
     `ignore_blocks` carries the caller's framing choice all the way down. It used
@@ -146,7 +152,8 @@ def read_block(block_id: str, debug: Callable[[str], None] = lambda s: None, ign
     elif d:
         yield from read_multiblock_directory(
             directory=Enviroment.block_dir + block_id,
-            ignore_blocks=ignore_blocks
+            ignore_blocks=ignore_blocks,
+            _depth=_depth
         )
 
     else:
