@@ -77,7 +77,15 @@ Steps 3 and 4 are best-effort: a sender that ignores the request transmits the b
 
 ### Nested Blocks
 
-It is possible to incorporate blocks within blocks, allowing for finer granularity in data management and transmission optimization.
+A block can contain blocks. A block of this type is stored as a multiblock directory: `_.json`, the parts, and `wbp.bin` (the object with block pointers).
+
+- `block_depth` (in `modify_env`) sets how many levels of blocks a sender frames. With `1`, the sender sends the content of each block flat. With more, it also sends the start and end markers of the blocks inside. The `previous_lengths_position` of a marker is always relative to the block that contains it.
+- A receiver reads any depth up to `client.MAX_BLOCK_NESTING`, independently of its own `block_depth`. It stores each block in the form that it gets: a directory if the stream frames blocks inside it, a single file if not. Thus, upgrade the receivers before you increase `block_depth` on the senders. An older receiver cannot read a nested stream.
+- The receiver calculates the hash of the expansion of each block and compares it with the block id. If the two are different, it does not store the block and the parse fails. If the receiver already has a nested block, it uses its own copy of that block to calculate the hash of the block that contains it.
+
+### Blocks with too much direct content
+
+The direct content of a block is the data that is not in one of its sub-blocks. A protobuf message cannot be larger than 2 GiB. If a sender sends a block flat, the receiver can get a block that it cannot parse. `block_splitter.split_block` corrects this. It reads the expansion of the block as a stream and walks it with the descriptor of the message type. It moves the fields that the caller selects into blocks of their own. The expansion does not change, so the block id does not change.
 
 ## Conclusion
 
