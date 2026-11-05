@@ -255,19 +255,27 @@ def skip_requested_blocks(
       * the end marker is *always* emitted, exactly once, skipped or not -- it is
         what the receiver is scanning for, and a block whose terminator never
         arrives desynchronises the rest of the stream;
-      * a skipped block swallows its children. Their markers are suppressed too,
-        which is what the receiver expects: it is not reading the parent's body
-        at all, so a child marker appearing inside it would be a block boundary
-        in a region it has already decided to ignore. `previous_lengths_position`
-        accounting is unaffected either way -- the receiver records it from the
-        *start* marker (`save_chunks_to_block` appends to `_json` before it
-        chooses to save or to drain), and start markers are always emitted.
+      * a skipped block swallows its children. A child that starts after the skip
+        began has both its markers suppressed: the receiver is not reading the
+        parent's body at all, so a child marker appearing inside it would be a
+        block boundary in a region it has already decided to ignore. A child that
+        was already open when the request landed is different: its start marker
+        has gone, the receiver holds it on its stack of open blocks, and a marker
+        of the parent while that child is open is an IntersectionError. So its end
+        marker is emitted, only without the chunks between. In short, an end
+        marker is emitted if and only if its start marker was.
+        `previous_lengths_position` accounting is unaffected either way -- the
+        receiver records it from the *start* marker (`save_chunks_to_block`
+        appends to `_json` before it chooses to save or to drain), and start
+        markers that are sent are always paired.
     """
     if control is None or not control.enabled:
         yield from buffer_iterator
         return
 
     stack: List[str] = []
+    # Whether the start marker of each open block went out, same order as `stack`.
+    opened: List[bool] = []
     skipping_at: typing.Optional[int] = None  # 1-based stack depth of the skipped block
 
     def outermost_skipped() -> typing.Optional[int]:
@@ -289,21 +297,26 @@ def skip_requested_blocks(
             if stack and stack[-1] == block_id:
                 depth = len(stack)
                 stack.pop()
-                if skipping_at is None or skipping_at == depth:
-                    # Either nothing is being skipped, or the block being skipped
-                    # ends right here. Its terminator is the one thing the
-                    # receiver still needs: it is what the drain loop in
-                    # save_chunks_to_block (and stop_generator) scans for.
-                    if skipping_at == depth:
-                        skipping_at = None
+                was_opened = opened.pop()
+                if skipping_at == depth:
+                    skipping_at = None
+                if was_opened:
+                    # Its start marker went out, so the receiver has it open and
+                    # waits for this one: the terminator is the one thing it still
+                    # needs (the drain loop in save_chunks_to_block and
+                    # stop_generator scan for it), also from a child that a skip
+                    # of its parent caught in the middle.
                     yield b
-                # else: nested inside a shallower skipped block, suppressed with it.
+                # else: it started inside a skipped block, suppressed with it.
                 continue
 
             stack.append(block_id)
             if skipping_at is None:
+                opened.append(True)
                 yield b
                 skipping_at = outermost_skipped()
+            else:
+                opened.append(False)
             continue
 
         if skipping_at is None:

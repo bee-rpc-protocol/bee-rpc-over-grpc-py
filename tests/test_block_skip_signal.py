@@ -395,6 +395,64 @@ class SkipFiltering(unittest.TestCase):
             ('block', self.OUTER),
         ], 'sender should stop at the first chunk after the request and terminate')
 
+    def test_request_for_a_parent_inside_an_open_child_still_closes_the_child(self):
+        """A skip for the parent that lands while a child is open.
+
+        The receiver has the child's start marker already. It reads the stream with
+        a stack of open blocks, so the child's end marker has to come before the
+        parent's. Dropping it made the receiver fail with IntersectionError."""
+        control = StreamControl()
+        spec = [(self.OUTER, [b'o1', (self.INNER, [b'i%d' % i for i in range(4)]), b'o2'])]
+
+        emitted = []
+        for buffer in skip_requested_blocks(self._stream(spec), control=control):
+            emitted.append(buffer)
+            # The request comes after the child start marker and one child chunk.
+            if buffer.HasField('chunk') and buffer.chunk == b'i0':
+                control._skip.add(self.OUTER)
+
+        got = self._summarise(emitted)
+        self.assertEqual(got, [
+            ('block', self.OUTER),
+            ('chunk', b'o1'),
+            ('block', self.INNER),
+            ('chunk', b'i0'),
+            ('block', self.INNER),   # the child is closed, as the receiver expects
+            ('block', self.OUTER),   # the parent skips the rest of its body
+        ])
+
+        # The receiver's rule (`parser_iterator`): a marker of an open block must be
+        # the innermost one.
+        stack = []
+        for kind, name in got:
+            if kind != 'block':
+                continue
+            if name in stack:
+                self.assertEqual(stack.pop(), name, 'markers cross each other')
+            else:
+                stack.append(name)
+        self.assertEqual(stack, [], 'a block was left open')
+
+    def test_children_that_start_after_the_request_are_dropped_whole(self):
+        """The other half: a child whose start marker was not sent has no end marker."""
+        other = 'cc' * 32
+        control = StreamControl()
+        spec = [(self.OUTER, [(self.INNER, [b'i0', b'i1']), (other, [b'x0']), b'o2'])]
+
+        emitted = []
+        for buffer in skip_requested_blocks(self._stream(spec), control=control):
+            emitted.append(buffer)
+            if buffer.HasField('chunk') and buffer.chunk == b'i0':
+                control._skip.add(self.OUTER)
+
+        self.assertEqual(self._summarise(emitted), [
+            ('block', self.OUTER),
+            ('block', self.INNER),
+            ('chunk', b'i0'),
+            ('block', self.INNER),   # opened before the request: closed
+            ('block', self.OUTER),   # `other` starts after it: not sent at all
+        ])
+
     def test_without_a_control_object_nothing_changes(self):
         spec = self._nested()
         self.assertEqual(
