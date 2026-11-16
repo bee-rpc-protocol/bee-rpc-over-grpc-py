@@ -1,3 +1,4 @@
+import bisect
 import hashlib
 import json
 import os
@@ -411,7 +412,36 @@ def entries_of_multiblock_directory(directory: str) -> typing.List[str]:
     ]
 
 
-def seek_expanded_position(position: int, file_list: typing.List[str]) -> typing.Tuple[str, int]:
+def expanded_starts(entries: typing.Sequence[typing.Union[str, bytes]]) -> typing.List[int]:
+    """Where each entry starts in the expanded stream, followed by where the stream ends.
+
+    An entry is a path, measured with `getsize` (a multiblock directory by its whole
+    expansion), or bytes already in memory, measured by their length. Each entry is
+    measured once: a caller that looks up many positions in the same list passes this
+    to `seek_expanded_position` instead of having every lookup measure the entries
+    before it again, which made those callers quadratic in the number of entries.
+    """
+    starts: typing.List[int] = [0]
+    for entry in entries:
+        starts.append(starts[-1] + (len(entry) if isinstance(entry, bytes) else getsize(entry)))
+    return starts
+
+
+def expanded_index(position: int, starts: typing.Sequence[int]) -> int:
+    """The index of the entry that holds `position`, given `expanded_starts` of the list.
+
+    Entries that expand to nothing hold no position and are never returned.
+    """
+    if not 0 <= position < starts[-1]:
+        raise ValueError(f"Position {position} is out of buffer range.")
+    return bisect.bisect_right(starts, position) - 1
+
+
+def seek_expanded_position(
+        position: int,
+        file_list: typing.List[str],
+        starts: typing.Optional[typing.Sequence[int]] = None,
+) -> typing.Tuple[str, int]:
     """Map a position in the expanded stream onto (single file, offset within it).
 
     Every entry of `file_list` is measured by how much it contributes to the
@@ -421,20 +451,22 @@ def seek_expanded_position(position: int, file_list: typing.List[str]) -> typing
     silently shifting every position past it. And a position landing inside such a
     block resolves against that block's own entries, to any depth, rather than
     reaching an `open()` that would raise IsADirectoryError.
+
+    `starts`, if given, is `expanded_starts(file_list)`, so that the entries are not
+    measured again for this lookup.
     """
-    remaining: int = position
-    for path in file_list:
-        length: int = getsize(path)
-        if remaining < length:
-            if os.path.isdir(path):
-                return seek_expanded_position(remaining, entries_of_multiblock_directory(path))
-            return path, remaining
-        remaining -= length
-    raise ValueError(f"Position {position} is out of buffer range.")
+    if starts is None:
+        starts = expanded_starts(file_list)
+    index: int = expanded_index(position, starts)
+    path: str = file_list[index]
+    remaining: int = position - starts[index]
+    if os.path.isdir(path):
+        return seek_expanded_position(remaining, entries_of_multiblock_directory(path))
+    return path, remaining
 
 
-def get_varint_at_position(position, file_list) -> int:
-    path, offset = seek_expanded_position(position=position, file_list=file_list)
+def get_varint_at_position(position, file_list, starts: typing.Optional[typing.Sequence[int]] = None) -> int:
+    path, offset = seek_expanded_position(position=position, file_list=file_list, starts=starts)
     with open(path, "rb") as file:
         file.seek(offset)
         result = 0
