@@ -1,6 +1,7 @@
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional, Sequence
 
-from bee_rpc.utils import LengthsValidationError, get_varint_at_position, get_pruned_block_length
+from bee_rpc.utils import LengthsValidationError, expanded_starts, get_varint_at_position, \
+    get_pruned_block_length
 
 
 def validate_lengths_tree(
@@ -8,6 +9,7 @@ def validate_lengths_tree(
         file_list: List[str],
         pointer_lengths: Dict[int, int],
         debug: Callable[[str], None] = lambda s: None,
+        starts: Optional[Sequence[int]] = None,
 ) -> None:
     """Check that a stored object's metadata describes the bytes it sits on.
 
@@ -26,13 +28,17 @@ def validate_lengths_tree(
         file_list: the parts and blocks the object expands to, in order.
         pointer_lengths: how long the pointer written at each position is.
         debug: where the running commentary goes, instead of stdout.
+        starts: `expanded_starts(file_list)`, if the caller already has it.
     """
     debug(f"Blocks: {blocks}")
+    if starts is None:
+        starts = expanded_starts(file_list)
 
     for block, pointer_lists in blocks.items():
         for pointer_list in pointer_lists:
             block_index_position = pointer_list[-1]
-            position_length = get_varint_at_position(block_index_position, file_list=file_list)
+            position_length = get_varint_at_position(block_index_position, file_list=file_list,
+                                                    starts=starts)
             block_length = get_pruned_block_length(
                 block_name=block, pointer_length=pointer_lengths[block_index_position])
 

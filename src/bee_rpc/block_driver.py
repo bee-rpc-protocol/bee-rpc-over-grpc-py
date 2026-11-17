@@ -5,13 +5,14 @@ from typing import Callable, Optional, Sequence, Union, List, Tuple, Dict, Gener
 from bee_rpc.validate_lengths_tree import validate_lengths_tree
 from bee_rpc.utils import METADATA_FILE_NAME, WITHOUT_BLOCK_POINTERS_FILE_NAME, Enviroment, \
     create_lengths_tree, encode_bytes, get_varint_at_position, get_pruned_block_length, getsize, \
-    block_pointer, block_pointer_length
+    block_pointer, block_pointer_length, expanded_index, expanded_starts
 
 
 def compute_wbp_lengths(
         tree: Dict[int, Union[Dict, str]],
         file_list: List[str],
-        pointer_lengths: Dict[int, int]
+        pointer_lengths: Dict[int, int],
+        starts: Optional[Sequence[int]] = None,
 ) -> Dict[int, int]:
     """The length each varint must state once blocks are replaced by their pointers.
 
@@ -19,12 +20,17 @@ def compute_wbp_lengths(
     the very lengths `regenerate_buffer` then emits, so the two cannot disagree.
     They used to be a constant here and a separately built message there, and drifted
     into two different encodings of the same object.
+
+    `starts` is `expanded_starts(file_list)`, if the caller already has it.
     """
+    if starts is None:
+        starts = expanded_starts(file_list)
+
     def __rec_compute_wbp_lengths(_tree: Dict[int, Union[Dict, str]], _file_list: List[str]) \
             -> Dict[int, Tuple[int, int]]:  # Tuple is wbp length and augmented pruned length.
         lengths: Dict[int, Tuple[int, int]] = {}
         for key, value in _tree.items():
-            position_length: int = get_varint_at_position(key, _file_list)
+            position_length: int = get_varint_at_position(key, _file_list, starts=starts)
             if isinstance(value, Dict):
                 pruned_length: int = 0
                 for k, v in __rec_compute_wbp_lengths(
@@ -49,7 +55,12 @@ def compute_wbp_lengths(
     return {k: v[0] for k, v in __rec_compute_wbp_lengths(_tree=tree, _file_list=file_list).items()}
 
 
-def set_varint_value(varint_pos: int, buffer: List[Union[bytes, str]], new_value: int):
+def set_varint_value(
+        varint_pos: int,
+        buffer: List[Union[bytes, str]],
+        new_value: int,
+        starts: Optional[Sequence[int]] = None,
+):
     def __set_varint_value(_varint_pos: int, _buffer: bytes, _new_value: int) -> bytes:
         """
         Sets the value of the varint at the given position in the Protobuf buffer to the given value and returns
@@ -79,7 +90,26 @@ def set_varint_value(varint_pos: int, buffer: List[Union[bytes, str]], new_value
     Modify the varint at the given position in the buffer which is composed by a list of bytes and binary files. 
     The position is based on the concatenation of all the bytes and binary files in the buffer.
     The function modify the buffer.
+
+    `starts`, if given, is `expanded_starts(buffer)` taken before any varint at or
+    before `varint_pos` was rewritten -- which holds for the positions
+    `regenerate_buffer` rewrites, from the last to the first -- so that finding the
+    entry does not measure every entry before it again.
     """
+    if starts is not None:
+        try:
+            index: int = expanded_index(varint_pos, starts)
+        except ValueError:
+            index = -1
+        if index < 0 or type(buffer[index]) != bytes:
+            raise Exception('gRPCbb block driver error on set varint value')
+        buffer[index] = __set_varint_value(
+            _varint_pos=varint_pos - starts[index],
+            _buffer=buffer[index],
+            _new_value=new_value
+        )
+        return
+
     offset: int = 0
     for index, value in enumerate(buffer):
         if type(value) == bytes:
@@ -114,11 +144,16 @@ def regenerate_buffer(
     ancestor to inherit its hash types from. False -- the default -- spells them out,
     which is what the top of a stored tree must do.
     """
+    # Measured once, before anything is rewritten. Going from the last position to the
+    # first, a rewrite only ever changes the length of the entry it is in, past the
+    # positions still to come; where each entry starts stays where it was.
+    starts: List[int] = expanded_starts(buffer)
     for varint_pos, new_value in sorted(lengths.items(), key=lambda x: x[0], reverse=True):
         set_varint_value(
                 varint_pos=varint_pos,
                 buffer=buffer,
                 new_value=new_value,
+                starts=starts,
             )
 
     for b in buffer:
@@ -203,18 +238,24 @@ def generate_wbp_file(
     debug("Buffer loaded correctly")
     debug("Validate lenghts tree")
 
+    # Where each part and block starts in the expansion, measured once for every
+    # lookup below. Each lookup used to measure all the entries before its position,
+    # with a stat() -- and for a multiblock directory, a walk of its metadata -- per
+    # entry: quadratic in the number of entries.
+    starts: List[int] = expanded_starts(file_list)
+
     # Raises rather than returning: a caller that cannot be told its object is
     # unusable has no way to stop, retry or report, and the failure surfaces
     # somewhere else entirely.
     validate_lengths_tree(blocks=blocks, file_list=file_list,
-                          pointer_lengths=pointer_lengths, debug=debug)
+                          pointer_lengths=pointer_lengths, debug=debug, starts=starts)
 
     debug("Create lengths tree")
     tree: Dict[int, Union[Dict, str]] = create_lengths_tree(blocks)
 
     debug("Compute lengths tree")
     recalculated_lengths: Dict[int, int] = compute_wbp_lengths(
-        tree=tree, file_list=file_list, pointer_lengths=pointer_lengths)
+        tree=tree, file_list=file_list, pointer_lengths=pointer_lengths, starts=starts)
 
     debug("Write wbp file")
     with open(dirname + '/' + WITHOUT_BLOCK_POINTERS_FILE_NAME, 'wb') as f:
